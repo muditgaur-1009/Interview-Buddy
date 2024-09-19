@@ -1,0 +1,1 @@
+pip install --upgrade langchain langchain_google_genai google-generativeai streamlit PyPDF2 faiss-cpu
