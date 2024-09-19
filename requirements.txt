@@ -5,3 +5,4 @@ streamlit
 PyPDF2
 faiss-cpu
 streamlit_chat
+langchain-community
