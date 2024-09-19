@@ -4,3 +4,4 @@ google-generativeai
 streamlit 
 PyPDF2
 faiss-cpu
+streamlit_chat
