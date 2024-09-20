@@ -3,4 +3,6 @@ langchain_google_genai
 google-generativeai 
 streamlit 
 PyPDF2
- faiss-cpu
+faiss-cpu
+streamlit_chat
+langchain-community

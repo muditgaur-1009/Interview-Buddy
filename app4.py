@@ -129,7 +129,7 @@ def hr_interview_bot():
 
     if st.session_state.vector_store_ready:
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.load_local("faiss_index", embeddings)
+        vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
         # Display chat history
         for i, chat in enumerate(st.session_state.chat_history):
@@ -186,6 +186,7 @@ def hr_interview_bot():
                 
                 st.write("Interview Summary and Evaluation:")
                 st.write(summary)
+
 def main():
     st.set_page_config("HR Interview Bot with Chat UI")
     st.header("HR Interview Bot powered by Gemini💁 with Chat UI")
