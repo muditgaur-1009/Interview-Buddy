@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_chat import message
 from PyPDF2 import PdfReader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 import os
@@ -9,10 +10,36 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.chains.question_answering import load_qa_chain
 from langchain.prompts import PromptTemplate
 from dotenv import load_dotenv
+from langchain.memory import ConversationBufferWindowMemory
+from langchain.evaluation import CriteriaEvalChain
+from transformers import pipeline
+import sounddevice as sd
+import numpy as np
+import torch
+from gtts import gTTS
+import tempfile
 
 load_dotenv()
 os.getenv("GOOGLE_API_KEY")
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+
+# Initialize STT model
+stt = pipeline("automatic-speech-recognition", model="facebook/wav2vec2-base-960h")
+
+def text_to_speech(text):
+    tts = gTTS(text=text, lang='en', slow=False)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as fp:
+        tts.save(fp.name)
+        return fp.name
+
+def speech_to_text():
+    duration = 30  # Record for 5 seconds
+    fs = 16000  # Sample rate
+    recording = sd.rec(int(duration * fs), samplerate=fs, channels=1)
+    sd.wait()
+    audio = np.squeeze(recording)
+    result = stt(audio)
+    return result["text"]
 
 def get_pdf_text(pdf_docs):
     text = ""
@@ -39,18 +66,21 @@ def get_vector_store(text_chunks):
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     vector_store.save_local("faiss_index")
 
-def generate_question(vector_store, previous_questions):
+def generate_question(vector_store, memory):
     question_prompt = f"""
-Given the following context, which includes the candidate's resume, the job description, and the job title,
-generate a thoughtful HR interview question that pertains specifically to the candidate's qualifications and the job requirements.
-Ensure the question is open-ended, allowing the candidate to elaborate on their skills, experiences, and qualifications. 
-Avoid repeating any of these previously asked questions: {previous_questions}.
+    Given the following context, which includes the candidate's resume, the job description, and the job title,
+    generate a thoughtful HR interview question that pertains specifically to the candidate's qualifications and the job requirements.
+    Ensure the question is open-ended, allowing the candidate to elaborate on their skills, experiences, and qualifications. 
+    Avoid repeating any previously asked questions.
 
-The question should effectively gauge the candidate's experience level and alignment with the role's requirements,
-considering both their background and the specific job they're applying for.
+    The question should effectively gauge the candidate's experience level and alignment with the role's requirements,
+    considering both their background and the specific job they're applying for.
 
-Question:
-"""
+    Previous conversation:
+    {memory.buffer}
+
+    Question:
+    """
     
     docs = vector_store.similarity_search(question_prompt, k=3)
     context = "\n".join([doc.page_content for doc in docs])
@@ -60,9 +90,42 @@ Question:
     
     return question.strip()
 
-def hr_interview_bot():
-    st.title("HR Interview Bot")
+def create_criteria_eval_chain():
+    llm = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0)
     
+    criteria = {
+        "relevance": "Is the content relevant to the job description and the question asked?",
+        "specificity": "Is the content specific and detailed enough?",
+        "clarity": "Is the content clear and easy to understand?",
+        "depth": "Does the content demonstrate depth of knowledge or experience?",
+        "conciseness": "Is the content concise without unnecessary information?",
+    }
+    
+    return CriteriaEvalChain.from_llm(llm=llm, criteria=criteria)
+
+def evaluate_content(eval_chain, content, question, job_description):
+    result = eval_chain.evaluate_strings(
+        prediction=content,
+        input=f"Question: {question}\nJob Description: {job_description}",
+        reference="The content should be relevant, specific, clear, demonstrate depth, and be concise in relation to the question and job description."
+    )
+    return result
+
+def hr_interview_bot():
+    st.title("Interactive HR Interview Bot")
+    
+    if 'memory' not in st.session_state:
+        st.session_state.memory = ConversationBufferWindowMemory(k=20)
+    
+    if 'evaluation_results' not in st.session_state:
+        st.session_state.evaluation_results = []
+    
+    if 'chat_history' not in st.session_state:
+        st.session_state.chat_history = []
+    
+    if 'eval_chain' not in st.session_state:
+        st.session_state.eval_chain = create_criteria_eval_chain()
+
     with st.sidebar:
         st.title("Upload Documents")
         resume_docs = st.file_uploader("Upload your Resume (PDF)", accept_multiple_files=True)
@@ -78,69 +141,97 @@ def hr_interview_bot():
                     text_chunks = get_text_chunks(combined_text)
                     get_vector_store(text_chunks)
                     st.session_state.vector_store_ready = True
+                    st.session_state.job_description = job_desc_text
                     st.success("Done")
+                    st.session_state.chat_history = []
+                    st.session_state.question_count = 0
             else:
                 st.warning("Please upload both resume and job description, and enter the job title.")
 
     if 'vector_store_ready' not in st.session_state:
         st.session_state.vector_store_ready = False
 
-    if 'current_question' not in st.session_state:
-        st.session_state.current_question = None
-
-    if 'question_count' not in st.session_state:
-        st.session_state.question_count = 0
-
-    if 'previous_questions' not in st.session_state:
-        st.session_state.previous_questions = []
-
-    if 'answers' not in st.session_state:
-        st.session_state.answers = []
-
     if st.session_state.vector_store_ready:
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        vector_store = FAISS.load_local("faiss_index", embeddings)
+        vector_store = FAISS.load_local("faiss_index", embeddings, allow_dangerous_deserialization=True)
 
-        if st.session_state.current_question is None:
-            st.session_state.current_question = generate_question(vector_store, st.session_state.previous_questions)
-            st.session_state.previous_questions.append(st.session_state.current_question)
+        # Display chat history
+        for i, chat in enumerate(st.session_state.chat_history):
+            message(chat["content"], is_user=chat["is_user"], key=f"chat_{i}")
 
-        st.write(f"Question {st.session_state.question_count + 1}: {st.session_state.current_question}")
-        user_answer = st.text_area(f"Your answer to Question {st.session_state.question_count + 1}", key=f"q{st.session_state.question_count + 1}")
+        # Generate new question if needed
+        if len(st.session_state.chat_history) % 2 == 0 and st.session_state.question_count < 5:
+            new_question = generate_question(vector_store, st.session_state.memory)
+            st.session_state.memory.save_context({"input": "HR"}, {"output": new_question})
+            
+            # Evaluate the generated question
+            question_eval = evaluate_content(st.session_state.eval_chain, new_question, "Generate an interview question", st.session_state.job_description)
+            st.session_state.evaluation_results.append(("Question", question_eval))
 
-        if st.button("Next Question"):
-            if user_answer:
-                st.session_state.answers.append(user_answer)
-                st.session_state.question_count += 1
-                if st.session_state.question_count < 5:
-                    st.session_state.current_question = generate_question(vector_store, st.session_state.previous_questions)
-                    st.session_state.previous_questions.append(st.session_state.current_question)
-                else:
-                    st.session_state.current_question = None
-                st.experimental_rerun()
-            else:
-                st.warning("Please provide an answer before moving to the next question.")
+            st.session_state.chat_history.append({"content": new_question, "is_user": False})
+            st.session_state.question_count += 1
 
-        if st.session_state.question_count >= 5:
-            if st.button("Generate Interview Summary"):
+            # Text-to-Speech for the question
+            audio_file = text_to_speech(new_question)
+            st.audio(audio_file, format="audio/mp3")
+
+            st.rerun()
+
+        # Get user input
+        input_method = st.radio("Choose input method:", ("Text", "Speech"))
+        
+        user_input = None
+        if input_method == "Text":
+            user_input = st.text_input("Your answer:", key="user_input")
+        else:
+            if st.button("Start Recording"):
+                with st.spinner("Recording..."):
+                    user_input = speech_to_text()
+                st.write(f"Transcribed: {user_input}")
+
+        if user_input:
+            st.session_state.chat_history.append({"content": user_input, "is_user": True})
+            st.session_state.memory.save_context({"input": "Candidate"}, {"output": user_input})
+            
+            # Evaluate the user's answer
+            answer_eval = evaluate_content(st.session_state.eval_chain, user_input, st.session_state.chat_history[-2]["content"], st.session_state.job_description)
+            st.session_state.evaluation_results.append(("Answer", answer_eval))
+
+            st.rerun()
+
+        # Generate summary after 5 questions
+        if st.session_state.question_count >= 5 and len(st.session_state.chat_history) % 2 == 0:
+            if st.button("Generate Interview Summary and Evaluation"):
                 summary_prompt = f"""
-Based on the following interview answers, provide a brief report on the candidate's performance, including areas where they excelled, 
-areas for improvement, and any inaccuracies or weaknesses in their responses. Consider the job description and the specific role they're applying for.
-{chr(10).join([f"Question: {q}{chr(10)}Answer: {a}{chr(10)}" for q, a in zip(st.session_state.previous_questions, st.session_state.answers)])}
-Provide a concise paragraph summarizing the candidate's background, strengths, and potential fit for the role. Assess their proficiency in answering questions,
- the accuracy of their responses, their communication skills, clarity of thought, and problem-solving abilities. 
- Highlight both positive aspects and constructive feedback to help the candidate improve their performance.
-"""
+                Based on the following interview conversation and evaluation results, provide a comprehensive report on the candidate's performance:
+
+                Conversation history:
+                {st.session_state.memory.buffer}
+
+                Evaluation results:
+                {st.session_state.evaluation_results}
+
+                Please provide:
+                1. A summary of the candidate's background, strengths, and potential fit for the role.
+                2. An assessment of their proficiency in answering questions, including relevance, specificity, clarity, depth, and conciseness of responses.
+                3. An evaluation of the quality of the interview questions, including relevance, specificity, clarity, depth, and conciseness.
+                4. Highlights of both positive aspects and areas for improvement.
+                5. Overall recommendation based on the interview performance and evaluation metrics.
+                """
 
                 model = ChatGoogleGenerativeAI(model="gemini-pro", temperature=0.3)
-                summary = model.predict(summary_prompt)
+                summary = model.invoke(summary_prompt)
                 
-                st.write("Interview Summary:")
+                st.write("Interview Summary and Evaluation:")
                 st.write(summary)
 
+                # Text-to-Speech for the summary
+                audio_file = text_to_speech(summary)
+                st.audio(audio_file, format="audio/mp3")
+
 def main():
-    st.set_page_config("HR Interview Bot")
-    st.header("HR Interview Bot powered by Gemini💁")
+    st.set_page_config("Interactive HR Interview Bot with Chat UI")
+    st.header("Interactive HR Interview Bot powered by Gemini💁 with Chat UI")
     
     hr_interview_bot()
 
